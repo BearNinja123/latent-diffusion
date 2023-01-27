@@ -1,4 +1,4 @@
-from layers import ResBlock, Downsample, Upsample, Attn2d 
+from layers import ResBlock, Downsample, Upsample, Attn2d, TransformerBlock, TimeEmbedding
 from transformers import CLIPTokenizerFast, CLIPTextModel
 from torchvision.models import vgg16, VGG16_Weights
 import torch.nn.functional as F
@@ -8,11 +8,11 @@ import torch
 
 class VAEEncoder(nn.Module):
     def __init__(self,
-            nc: int,
-            ch_mults: tuple,
-            nlayers_per_res: int,
-            nz: int
-            ):
+        nc: int,
+        ch_mults: tuple,
+        nlayers_per_res: int,
+        nz: int
+    ):
         '''
         nc: base number of channels
         ch_mults: channel multiplier per resolution
@@ -65,11 +65,11 @@ class VAEEncoder(nn.Module):
 
 class VAEDecoder(nn.Module):
     def __init__(self,
-            nc: int,
-            ch_mults: tuple,
-            nlayers_per_res: int,
-            nz: int
-            ):
+        nc: int,
+        ch_mults: tuple,
+        nlayers_per_res: int,
+        nz: int
+    ):
         '''
         nc: base number of channels
         ch_mults: channel multiplier per resolution
@@ -215,7 +215,7 @@ class FrozenCLIPEmbedder(nn.Module):
     def __init__(self, version="openai/clip-vit-base-patch32", device="cuda", max_length=77):
         super().__init__()
         self.tokenizer = CLIPTokenizerFast.from_pretrained(version)
-        self.transformer = CLIPTextModel.from_pretrained(version)
+        self.transformer = CLIPTextModel.from_pretrained(version).to(device)
         self.device = device
         self.max_length = max_length
         self.freeze()
@@ -233,3 +233,103 @@ class FrozenCLIPEmbedder(nn.Module):
 
         z = outputs.last_hidden_state
         return z
+
+class TimestepEmbedSequential(nn.Sequential):
+    '''
+    A sequential module that passes timestep embeddings to the children that
+    support it as an extra input.
+    '''
+    def forward(self, x, emb, context=None):
+        for layer in self:
+            if isinstance(layer, ResBlock):
+                x = layer(x, emb)
+            elif isinstance(layer, TransformerBlock):
+                x = layer(x, context)
+            else:
+                x = layer(x)
+        return x
+
+class UNet(nn.Module):
+    def __init__(self,
+        in_c: int = 16,
+        nc: int = 256,
+        ch_mults: list = [1, 2, 4],
+        nlayers_per_res: int = 2,
+        context_dim: int = 512,
+    ):
+        super().__init__()
+        self.in_c = in_c
+        self.nc = nc
+        self.ch_mults = ch_mults
+        self.nlayers_per_res = nlayers_per_res
+        self.context_dim = context_dim
+        self.temb_c = 4 * nc
+
+        self.time_embed = TimeEmbedding(nc, self.temb_c)
+        self.first_conv = nn.Conv2d(in_c, nc, 3, padding='same')
+
+        self.downs = nn.ModuleList([])
+        down_out_cs = []
+        
+        block_out_c = self.nc
+        for block_idx, ch_mult in enumerate(ch_mults):
+            block = []
+            block_in_c, block_out_c = block_out_c, nc * ch_mult
+            down_out_cs.append(block_out_c)
+
+            layer_out_c = block_in_c
+            for _ in range(nlayers_per_res):
+                layer_in_c, layer_out_c = layer_out_c, block_out_c
+                block.append(ResBlock(layer_in_c, layer_out_c, self.temb_c))
+                block.append(TransformerBlock(layer_out_c, layer_out_c, context_dim))
+            if block_idx != len(ch_mults) - 1:
+                block.append(Downsample(block_out_c))
+
+            block = TimestepEmbedSequential(*block)
+            self.downs.append(block)
+
+        self.mid_block = TimestepEmbedSequential(
+                ResBlock(block_out_c, block_out_c, self.temb_c),
+                TransformerBlock(block_out_c, block_out_c, context_dim),
+                ResBlock(block_out_c, block_out_c, self.temb_c),
+            )
+
+        self.ups = nn.ModuleList([])
+        for block_idx, ch_mult in enumerate(reversed(ch_mults)):
+            block = []
+            block_in_c, block_out_c = block_out_c, nc * ch_mult
+            down_c = down_out_cs.pop()
+
+            layer_out_c = block_in_c + down_c
+            for _ in range(nlayers_per_res):
+                layer_in_c, layer_out_c = layer_out_c, block_out_c
+                block.append(ResBlock(layer_in_c, layer_out_c, self.temb_c))
+                block.append(TransformerBlock(layer_out_c, layer_out_c, context_dim))
+            if block_idx != 0:
+                block.append(Upsample(block_out_c))
+
+            block = TimestepEmbedSequential(*block)
+            self.ups.append(block)
+
+        self.out = nn.Sequential(
+                nn.GroupNorm(8, block_out_c + nc),
+                nn.SiLU(),
+                nn.Conv2d(block_out_c + nc, in_c, 3, padding='same')
+            )
+
+    def forward(self, x, timesteps, context):
+        temb = self.time_embed(timesteps)
+        x = self.first_conv(x)
+        skip = x
+        downs = []
+        for block in self.downs:
+            x = block(x, temb, context)
+            downs.append(x)
+        x = self.mid_block(x, temb, context)
+        for block in self.ups:
+            x = torch.cat([x, downs.pop()], dim=1)
+            x = block(x, temb, context)
+        x = torch.cat([x, skip], dim=1)
+        x = self.out(x)
+
+        return x
