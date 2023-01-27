@@ -21,6 +21,7 @@ class PercepLoss(nn.Module):
         self.percep_model = PercepModel()
         self.percep_model.requires_grad_(False)
         self.percep_model.eval()
+        self.weights = [7., 9., 17., 52., 47.]
 
     def forward(self, y_pred, y):
         y_pred_fmaps = self.percep_model(y_pred)
@@ -31,8 +32,8 @@ class PercepLoss(nn.Module):
 
         # perceptual loss
         p_loss = torch.zeros((), device=y.device)
-        for y_pred_fmap, y_fmap in zip(y_pred_fmaps, y_fmaps):
-            p_loss += F.mse_loss(self.normalize_tensor(y_pred_fmap), self.normalize_tensor(y_fmap))
+        for y_pred_fmap, y_fmap, weight in zip(y_pred_fmaps, y_fmaps, self.weights):
+            p_loss += weight * F.mse_loss(self.normalize_tensor(y_pred_fmap), self.normalize_tensor(y_fmap))
 
         return l1_loss, p_loss
 
