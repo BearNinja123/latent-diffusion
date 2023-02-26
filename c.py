@@ -1,5 +1,12 @@
+from ptflops import get_model_complexity_info
+from torch import nn
+import torch
+
+from models import FrozenCLIPEmbedder
 from layers import ResBlock, Downsample, Upsample, Attn2d, TransformerBlock, TimeEmbedding
-from transformers import CLIPTokenizerFast, CLIPTextModel
+from transformers import CLIPTokenizerFast, CLIPTextModel, logging
+logging.set_verbosity_error()
+
 from torchvision.models import vgg16, VGG16_Weights
 import torch.nn.functional as F
 import torch.nn as nn
@@ -122,11 +129,9 @@ class VAEDecoder(nn.Module):
 class VAE(nn.Module):
     def __init__(self):
         super().__init__()
-        #self.nc = 64
-        self.nc = 8
+        self.nc = 64
         self.ch_mults = (1, 2, 2, 4)
-        #self.nlayers_per_res = 2
-        self.nlayers_per_res = 1
+        self.nlayers_per_res = 2
         self.nz = 16
         self.encoder = VAEEncoder(nc=self.nc, ch_mults=self.ch_mults, nlayers_per_res=self.nlayers_per_res, nz=self.nz)
         self.decoder = VAEDecoder(nc=self.nc, ch_mults=self.ch_mults, nlayers_per_res=self.nlayers_per_res, nz=self.nz)
@@ -142,100 +147,6 @@ class VAE(nn.Module):
         std = torch.exp(0.5 * log_var)
         eps = torch.randn_like(log_var)
         return mean + eps * std
-
-class PercepModel(nn.Module):
-    def __init__(self):
-        super().__init__()
-        #self.vgg = vgg16(weights=VGG16_Weights.IMAGENET1K_V1)
-        self.vgg = vgg16(pretrained=True)
-        self.fmap_layers = (3, 8, 15, 22, 29) # layer indexes which contain perceptual feature map info
-        
-        # expects inputs to be between [-1, 1]
-        self.register_buffer('shift', torch.Tensor([-.030, -.088, -.188])[None, :, None, None])
-        self.register_buffer('scale', torch.Tensor([.458, .448, .450])[None, :, None, None])
-
-        blocks = []
-        e_i = 0
-        for layer_idx in self.fmap_layers:
-            s_i, e_i = e_i, layer_idx
-            blocks.append(self.vgg.features[s_i:e_i])
-        self.blocks = nn.ModuleList(blocks)
-
-    def forward(self, x):
-        out = []
-        x = (x - self.shift) / self.scale
-        for block in self.blocks:
-            x = block(x)
-            out.append(x)
-        return out
-
-class Discriminator(nn.Module):
-    '''
-    just a normal PatchGAN discriminator model - copied from https://github.com/CompVis/taming-transformers/blob/2908a53b88478e5812d619b6ac003dbb29b069a0/taming/modules/discriminator/model.py
-    '''
-    def __init__(self, input_nc: int = 3, ndf: int = 64, n_layers: int = 3):
-        '''
-        input_nc: the number of channels in input images
-        ndf: the number of filters in the last conv layer
-        n_layers: the number of conv layers in the discriminator
-        norm_layer: normalization layer
-        '''
-        super().__init__()
-        use_bias = False # because batch norm after conv nullifies bias
-
-        kw = 4
-        padw = 1
-        sequence = [nn.Conv2d(input_nc, ndf, kernel_size=kw, stride=2, padding=padw), nn.LeakyReLU(0.2)]
-        nf_mult = 1
-        nf_mult_prev = 1
-        for n in range(1, n_layers):  # gradually increase the number of filters
-            nf_mult_prev = nf_mult
-            nf_mult = min(2 ** n, 8)
-            sequence += [
-                nn.Conv2d(ndf * nf_mult_prev, ndf * nf_mult, kernel_size=kw, stride=2, padding=padw, bias=use_bias),
-                nn.GroupNorm(8, ndf * nf_mult),
-                nn.LeakyReLU(0.2)
-            ]
-
-        nf_mult_prev = nf_mult
-        nf_mult = min(2 ** n_layers, 8)
-        sequence += [
-            nn.Conv2d(ndf * nf_mult_prev, ndf * nf_mult, kernel_size=kw, stride=1, padding=padw, bias=use_bias),
-            nn.GroupNorm(8, ndf * nf_mult),
-            nn.LeakyReLU(0.2)
-        ]
-
-        sequence += [
-            nn.Conv2d(ndf * nf_mult, 1, kernel_size=kw, stride=1, padding=padw)]  # output 1 channel prediction map
-        self.main = nn.Sequential(*sequence)
-
-    def forward(self, x):
-        return self.main(x)
-
-class FrozenCLIPEmbedder(nn.Module):
-    """Uses the CLIP transformer encoder for text (from Hugging Face)"""
-    def __init__(self, version="openai/clip-vit-base-patch32", device="cuda", max_length=77):
-        super().__init__()
-        self.tokenizer = CLIPTokenizerFast.from_pretrained(version)
-        self.transformer = CLIPTextModel.from_pretrained(version).to(device)
-        self.device = device
-        self.max_length = max_length
-        self.freeze()
-
-    def freeze(self):
-        self.transformer = self.transformer.eval()
-        for param in self.parameters():
-            param.requires_grad = False
-
-    def forward(self, text):
-        batch_encoding = self.tokenizer(text, truncation=True, max_length=self.max_length, return_length=True,
-                                        return_overflowing_tokens=False, padding="max_length", return_tensors="pt")
-        tokens = batch_encoding["input_ids"].to(self.device)
-        print('t', tokens.shape)
-        outputs = self.transformer(input_ids=tokens)
-
-        z = outputs.last_hidden_state
-        return z
 
 class TimestepEmbedSequential(nn.Sequential):
     '''
@@ -256,10 +167,9 @@ class UNet(nn.Module):
     def __init__(self,
         in_c: int = 16,
         nc: int = 256,
-        #nc: int = 32,
         ch_mults: list = [1, 2, 4],
         nlayers_per_res: int = 2,
-        context_dim: int = 768,
+        context_dim: int = 512,
     ):
         super().__init__()
         self.in_c = in_c
@@ -321,7 +231,9 @@ class UNet(nn.Module):
                 nn.Conv2d(block_out_c + nc, in_c, 3, padding='same')
             )
 
-    def forward(self, x, timesteps, context):
+    def forward(self, x):
+        timesteps = torch.zeros((x.shape[0],))
+        context = torch.zeros((x.shape[0],77,self.context_dim))
         temb = self.time_embed(timesteps)
         x = self.first_conv(x)
         skip = x
@@ -337,3 +249,42 @@ class UNet(nn.Module):
         x = self.out(x)
 
         return x
+
+def get_gmacs(macs_str):
+    macs, base = macs_str.split()
+    macs = float(macs)
+    if 'kmac' in base.lower():
+        return macs / 1000 / 1000
+    elif 'mmac' in base.lower():
+        return macs / 1000
+    elif 'gmac' in base.lower():
+        return macs
+
+# base: 178.7 gflops per forward + backward pass
+# big: 243.5 gflops per forward + backward pass
+
+net = CLIPTextModel.from_pretrained('openai/clip-vit-large-patch14')
+#net = CLIPTextModel.from_pretrained('openai/clip-vit-base-patch32')
+clip_input_constructor = lambda shape: {'input_ids': torch.ones((1, *shape), dtype=torch.long)}
+clip_macs, params = get_model_complexity_info(net, (77,), input_constructor=clip_input_constructor, as_strings=True, print_per_layer_stat=False, verbose=False)
+print('CLIP')
+print('{:<30}  {:<8}'.format('Computational complexity: ', clip_macs))
+print('{:<30}  {:<8}'.format('N params: ', params))
+
+net = VAEEncoder(64,[1,2,2,4],2,16)
+vae_macs, params = get_model_complexity_info(net, (3,256,256), as_strings=True, print_per_layer_stat=False, verbose=False)
+print('VAE Encoder')
+print('{:<30}  {:<8}'.format('Computational complexity: ', vae_macs))
+print('{:<30}  {:<8}'.format('N params: ', params))
+
+net = UNet(nc=256, context_dim=768)
+#net = UNet(nc=64, context_dim=512)
+unet_macs, params = get_model_complexity_info(net, (net.in_c,16,16), as_strings=True, print_per_layer_stat=False, verbose=False)
+print('UNet')
+print('{:<30}  {:<8}'.format('Computational complexity: ', unet_macs))
+print('{:<30}  {:<8}'.format('N params: ', params))
+
+total_gmacs = sum(get_gmacs(i) for i in (clip_macs, vae_macs, unet_macs))
+print('Total GMacs:', total_gmacs)
+print('Total GFLOPs per forward pass:', 2*total_gmacs)
+print('Total GFLOPs per forward and backward pass:', 3*2*total_gmacs)

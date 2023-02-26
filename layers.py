@@ -214,7 +214,7 @@ class TimeEmbedding(nn.Module):
         self.out_c = out_c
         self.max_period = max_period
         half = embed_c // 2
-        self.freqs = torch.exp(-math.log(max_period) * torch.linspace(0, 1, half))
+        self.register_buffer('freqs', torch.exp(-math.log(max_period) * torch.linspace(0, 1, half)))
         self.ff = nn.Sequential(
                 nn.Linear(embed_c, out_c),
                 nn.SiLU(),
@@ -222,7 +222,7 @@ class TimeEmbedding(nn.Module):
             )
 
     def forward(self, timesteps):
-        t_freqs = torch.outer(timesteps, self.freqs.to(timesteps.device))
+        t_freqs = torch.outer(timesteps, self.freqs)
         emb = torch.cat([t_freqs.cos(), t_freqs.sin()], dim=-1)
         emb = self.ff(emb)
         return emb
